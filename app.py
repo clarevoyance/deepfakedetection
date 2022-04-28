@@ -1,0 +1,164 @@
+import random
+
+import streamlit as st
+from encoder import LatentSpace
+from vae import VAE
+from db import VectorDB
+from PIL import Image
+from plots import BokehPlots
+import numpy as np
+from collections import Counter
+
+st.set_page_config(layout="wide")
+st.title("GAN Vector Database for Facial Similarity Search")
+
+
+# TODO: Check if all data and models are available
+# Initialize Everything
+@st.cache(allow_output_mutation=True)
+def load_vae():
+	return VAE()
+
+
+@st.cache(allow_output_mutation=True)
+def load_encoder():
+	return LatentSpace()
+
+
+@st.cache(allow_output_mutation=True)
+def load_db():
+	return VectorDB()
+
+
+def load_plots():
+	return BokehPlots()
+
+
+db = load_db()
+encoder = load_encoder()
+vae = load_vae()
+plot = load_plots()
+
+
+parameter_dict = {
+	"age": 0,
+	"eyeglasses": 0,
+	"gender": 0,
+	"pose": 0,
+	"smile": 0
+}
+
+st.sidebar.title("Parameters")
+st.session_state['seed'] = "74658"
+
+
+def generate_base_image(_vae):
+	_, latent_codes = _vae.generate_base_image(int.from_bytes(st.session_state['seed'].encode(),
+	                                                          byteorder="big") % 16047)
+	st.session_state['latent_codes'] = latent_codes
+
+
+if "latent_codes" not in st.session_state:
+	generate_base_image(vae)
+
+
+for parameter in parameter_dict:
+	parameter_dict[parameter] = st.sidebar.slider(parameter, -3.0, 3.0, 0.0)
+
+st.sidebar.title("How To")
+st.sidebar.write(
+	"""Play with these sliders to explore the latent space of the VAE."""
+)
+
+st.sidebar.write(
+	"""Your generated image is shown on the right and compared to a huge number of known faces.
+	If your generated face is very similar to a known face the known face will be shown next to it.
+	Use the latent space browser below to explore the similarity space of known faces. 
+	Your generated face is marked as a red dot.
+	"""
+)
+
+st.sidebar.write(
+	"""There are 202,599 images in the Vector Database that represent 10,177 identities. 
+	All integers on this website represent an identity."""
+)
+
+st.sidebar.write(
+	"""To quickly generate a completely new face just reload the page."""
+)
+
+# Generate Image according to base image and VAE parameters
+left, right = st.columns(2)
+
+with st.spinner('Generating Image...'):
+	image = vae.generate_variational_image(st.session_state['latent_codes'], parameter_dict)
+	with left:
+		st.subheader("Generated Image")
+		st.image(image, width=218)
+
+with st.spinner('Finding Neighbors...'):
+	# Get image's latent space embedding
+	embedding = list(encoder.transform(image))
+
+	# Get image's neighbors
+	idx_to_plot = db.lookup_by_vector(embedding)
+
+	# Get neighbors' embeddings, images and identities
+	neighbor_vectors = [db.index.get_item_vector(idx) for idx in idx_to_plot]
+	neighbor_images = [db.load_image(idx) for idx in idx_to_plot]
+	neighbor_identities = [db.idx_to_identity[idx]['identity'] for idx in idx_to_plot]
+
+	# Check if a neighbor is dominant
+	identity_check = Counter(neighbor_identities)
+	most_common = identity_check.most_common(1)[0]
+
+	if most_common[1] > 1:
+		fil = neighbor_identities.index(most_common[0])
+		identity_image = neighbor_images[fil]
+		with right:
+			st.subheader(f"Close to {most_common[0]}")
+			st.image(identity_image)
+
+	# Add some random embeddings, images and identities
+	random_selection = np.random.choice(len(db.idx_to_identity), 50)
+	random_vectors = [db.index.get_item_vector(idx) for idx in random_selection]
+	random_images = [db.load_image(idx) for idx in random_selection]
+	random_identities = [db.idx_to_identity[idx]['identity'] for idx in random_selection]
+
+	st.subheader("Most similar known faces")
+	st.pyplot(plot.plot_neighbors(neighbor_images, neighbor_identities))
+
+# Interactive Plots
+st.subheader("Interactive Latent Space Browser")
+interactive = st.empty()
+
+with st.spinner('Generating PCA plot...'):
+	interactive.bokeh_chart(plot.plot_2d_v2(embedding, image,
+	                               neighbor_vectors, neighbor_images, neighbor_identities,
+	                               random_vectors, random_images, random_identities
+	                               ), use_container_width=True)
+
+
+with st.spinner('Generating VAE Basis (this is very compute intensive)...'):
+	# Generate VAE basis
+	vae_lines = {}
+
+	for parameter in list(vae.parameters.keys()):
+		axis_images = [Image.fromarray(img) for img in
+		               vae.generate_vae_axis(parameter, st.session_state["latent_codes"])]
+		axis_embeddings = encoder.transform_batch(axis_images)
+		vae_lines[parameter] = axis_embeddings
+
+	interactive.bokeh_chart(plot.plot_2d_v2(embedding, image,
+	                               neighbor_vectors, neighbor_images, neighbor_identities,
+	                               random_vectors, random_images, random_identities,
+	                               vae_lines=vae_lines
+	                               ), use_container_width=True)
+
+	st.write("""The shown splines represent the axis generated by each of the VAE's parameters - e. g. 
+	from very young to very old, etc. """)
+
+st.session_state['seed'] = st.sidebar.text_input('seed', '6242')
+
+if st.sidebar.button("Generate new Image"):
+	generate_base_image(vae)
